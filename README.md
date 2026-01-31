@@ -1,143 +1,91 @@
-# URL to OpenGraph Image Web Service ✨
+# URL to OG Image Service
 
-A cute web service that can turn any URL into a screenshot with common OpenGraph dimensions! Perfect for generating preview images for social media.
+Screenshot service for OpenGraph images with Cloudflare R2 caching.
 
-## Installation
+## Features
 
-### Standard Installation
+- PNG screenshots at 1280x720 (default)
+- Cloudflare R2 storage with CDN redirect
+- TTL-based cache expiration (default 7 days)
+- Per-URL TTL override
+- Domain whitelist
+
+## Setup
 
 ```bash
-# Clone the repository
-git clone <your-repo-url>
-cd url2og
-
-# Install dependencies
 npm install
 ```
 
-### Docker Installation
+Create `.env`:
+
+```
+PORT=4040
+R2_ACCOUNT_ID=your_account_id
+R2_ACCESS_KEY=your_access_key
+R2_SECRET_KEY=your_secret_key
+R2_BUCKET=url2og
+CDN_DOMAIN=cdn.yourdomain.com
+PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+```
 
 ```bash
-# Build the Docker image
-docker build -t url2og .
-
-# Run the container
-docker run -p 4040:4040 url2og
-
-# Run with domain whitelist
-docker run -p 4040:4040 -e ALLOWED_DOMAINS="example.com,mysite.org" url2og
-
-# Run with custom security settings
-docker run -p 4040:4040 \
-  -e ALLOWED_DOMAINS="example.com,mysite.org" \
-  -e MAX_WIDTH=2000 \
-  -e MAX_HEIGHT=2000 \
-  -e MAX_CACHE_SIZE_MB=250 \
-  -e MAX_CONCURRENT_REQUESTS=5 \
-  url2og
+npm start
 ```
 
 ## Usage
 
-```bash
-# Start the web service
-npm start
-
-# Start with domain whitelist
-ALLOWED_DOMAINS="example.com,mysite.org" npm start
-
-# Start with custom security settings
-MAX_WIDTH=2000 MAX_HEIGHT=2000 MAX_CACHE_SIZE_MB=250 npm start
 ```
+# Basic
+/?url=https://example.com
 
-Then open your browser to http://localhost:4040
+# Custom dimensions
+/?url=https://example.com&width=1200&height=630
+
+# Custom TTL (days) - for pages with dynamic content
+/?url=https://example.com&ttl=1
+
+# Skip cache - always regenerate
+/?url=https://example.com&nocache=1
+```
 
 ## Environment Variables
 
-| Variable | Description | Default | Example |
-|----------|-------------|---------|---------|
-| `PORT` | Port to run the server on | `4040` | `PORT=8080 npm start` |
-| `ALLOWED_DOMAINS` | Comma-separated list of allowed domains | (none) | `ALLOWED_DOMAINS="example.com,mysite.org"` |
-| `PUPPETEER_EXECUTABLE_PATH` | Custom path to Chrome/Chromium executable | (auto) | Used automatically in Docker |
-| `MAX_WIDTH` | Maximum allowed width in pixels | `3000` | `MAX_WIDTH=2000` |
-| `MAX_HEIGHT` | Maximum allowed height in pixels | `3000` | `MAX_HEIGHT=2000` |
-| `MAX_CACHE_SIZE_MB` | Maximum cache size in MB | `500` | `MAX_CACHE_SIZE_MB=250` |
-| `MAX_CONCURRENT_REQUESTS` | Maximum concurrent screenshot requests | `10` | `MAX_CONCURRENT_REQUESTS=5` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `4040` | Server port |
+| `R2_ACCOUNT_ID` | - | Cloudflare account ID |
+| `R2_ACCESS_KEY` | - | R2 API access key |
+| `R2_SECRET_KEY` | - | R2 API secret key |
+| `R2_BUCKET` | `url2og` | R2 bucket name |
+| `CDN_DOMAIN` | `cdn.currencytransfer.com` | CDN domain for redirects |
+| `CACHE_TTL_DAYS` | `7` | Default cache TTL in days |
+| `ALLOWED_DOMAINS` | (hardcoded) | Comma-separated domain whitelist |
+| `DEV_MODE` | `false` | Skip domain whitelist when `true` |
+| `MAX_WIDTH` | `3000` | Maximum screenshot width |
+| `MAX_HEIGHT` | `3000` | Maximum screenshot height |
 
-## API
+## How It Works
 
-### Get Screenshot
+1. Request comes in: `/?url=https://example.com`
+2. Check R2 for cached image
+3. If cached and not expired: 302 redirect to CDN
+4. If not cached or expired: capture screenshot, upload to R2, redirect to CDN
 
-```
-GET /?url=<target-url>[&width=<width>&height=<height>]
-```
+## Local Development
 
-#### Parameters:
-
-- `url`: The URL to capture (required)
-- `width`: Width of image in pixels (default: 1200, max: defined by MAX_WIDTH)
-- `height`: Height of image in pixels (default: 630, max: defined by MAX_HEIGHT)
-
-#### Examples:
-
-Basic usage:
-```
-http://localhost:4040/?url=google.com
+```bash
+DEV_MODE=true node index.js
 ```
 
-Custom dimensions:
-```
-http://localhost:4040/?url=twitter.com&width=800&height=400
-```
+This disables domain whitelist for testing with any URL.
 
-### Health Check
+## Deployment
 
-```
-GET /health
-```
+See nginx and systemd config in your deployment notes. Requires:
+- Node.js 22+
+- Google Chrome (`google-chrome-stable`)
+- Cloudflare R2 bucket with public custom domain
 
-Returns 200 OK if the service is running properly.
+## License
 
-## Features
-
-- 🌸 Returns JPEG images directly in the response
-- 🌟 Auto-prefixes URLs with https:// if protocol is missing
-- 💖 Includes a friendly web interface with a form
-- 🎀 Optimized with browser reuse for better performance
-- 🍡 Standard OpenGraph dimensions (1200×630) by default
-- 💾 Two-level caching system for improved performance
-- 🧹 Automatic cache management with 7-day retention policy
-- 🔒 Domain whitelist to prevent unauthorized usage
-- 🐳 Docker support for easy deployment
-- 🛡️ Enhanced security features for production use
-
-## Security Features
-
-- Domain whitelist restricts which sites can be captured
-- Size limits for images prevent resource abuse
-- Request rate limiting prevents DoS attacks
-- Disk size management prevents filling server storage
-- Docker container runs as non-root user
-- Regular security headers to prevent common attacks
-- Resource filtering to reduce attack surface
-- Health check endpoint for monitoring
-- Error handling that doesn't leak information
-
-## Technical Details
-
-- Images are stored in a filesystem cache (`./cache` directory)
-- In-memory caching layer for faster repeat access
-- Cache keys are generated using MD5 hash of URL + dimensions
-- Response headers include `X-Cache: HIT` or `X-Cache: MISS` to indicate cache status
-- Cache cleanup runs automatically every 24 hours to remove expired entries
-- Domain whitelist supports both exact domains and subdomains (e.g., allowing `example.com` also allows `sub.example.com`)
-
-## Requirements
-
-### Without Docker
-- Node.js 14+
-- Internet connection
-
-### With Docker
-- Docker
-- Internet connection
+AGPL-3.0
