@@ -2,257 +2,121 @@
 
 import express from 'express';
 import puppeteer from 'puppeteer';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import crypto from 'crypto';
-import NodeCache from 'node-cache';
+import { S3Client, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 4040;
 
-// Security maximum sizes
+// R2 Configuration
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
+const R2_ACCESS_KEY = process.env.R2_ACCESS_KEY;
+const R2_SECRET_KEY = process.env.R2_SECRET_KEY;
+const R2_BUCKET = process.env.R2_BUCKET || 'url2og';
+const CDN_DOMAIN = process.env.CDN_DOMAIN || 'cdn.currencytransfer.com';
+
+const s3Client = new S3Client({
+  region: 'auto',
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY,
+    secretAccessKey: R2_SECRET_KEY,
+  },
+});
+
+// Settings
 const MAX_WIDTH = parseInt(process.env.MAX_WIDTH || '3000');
 const MAX_HEIGHT = parseInt(process.env.MAX_HEIGHT || '3000');
-const MAX_CACHE_SIZE_MB = parseInt(process.env.MAX_CACHE_SIZE_MB || '1000'); // 1000MB default
+const DEFAULT_WIDTH = 1280;
+const DEFAULT_HEIGHT = 720;
 const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS || '10');
+const CACHE_TTL_DAYS = parseInt(process.env.CACHE_TTL_DAYS || '7');
 
-// Memory optimization settings
-const BROWSER_IDLE_TIMEOUT = parseInt(process.env.BROWSER_IDLE_TIMEOUT || '120000'); // 2 minutes default
-const MEMORY_CACHE_TTL = parseInt(process.env.MEMORY_CACHE_TTL || '600'); // 10 minutes default (short for low memory)
-const MAX_MEMORY_CACHE_KEYS = parseInt(process.env.MAX_MEMORY_CACHE_KEYS || '20'); // Very limited for low memory
-const DISK_CACHE_MAX_AGE_DAYS = parseInt(process.env.DISK_CACHE_MAX_AGE_DAYS || '1'); // 1 day default
+// Domain whitelist - only these domains can be screenshotted
+const ALLOWED_DOMAINS = process.env.ALLOWED_DOMAINS
+  ? process.env.ALLOWED_DOMAINS.split(',').map(d => d.trim())
+  : [
+      'currencytransfer.com',
+      'mycurrencytransfer.com',
+      'mytravelmoney.co.uk',
+      'payplexo.com',
+    ];
+const DEV_MODE = process.env.DEV_MODE === 'true';
 
-// Concurrent request tracking
 let activeRequests = 0;
-
-// Read domain whitelist from environment variables
-const ALLOWED_DOMAINS = process.env.ALLOWED_DOMAINS 
-  ? process.env.ALLOWED_DOMAINS.split(',').map(domain => domain.trim().toLowerCase())
-  : [];
-
-const WHITELIST_ENABLED = ALLOWED_DOMAINS.length > 0;
-
-// Add security headers middleware
-app.use((req, res, next) => {
-  // Security headers
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'");
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  next();
-});
-
-// Rate limiting middleware
-app.use((req, res, next) => {
-  // Check if server is shutting down
-  if (isShuttingDown) {
-    return res.status(503).send('Server is shutting down');
-  }
-  
-  // Check if we're at max concurrent requests
-  if (browserQueue.length >= MAX_CONCURRENT_REQUESTS) {
-    return res.status(429).send('Too many requests. Please try again later.');
-  }
-  next();
-});
-
-// Function to check if a URL's domain is in the whitelist
-function isDomainAllowed(url) {
-  if (!WHITELIST_ENABLED) return true;
-  
-  try {
-    const urlObj = new URL(url);
-    const domain = urlObj.hostname.toLowerCase();
-    
-    // Check if the domain or any parent domain is in the whitelist
-    return ALLOWED_DOMAINS.some(allowedDomain => {
-      return domain === allowedDomain || 
-             domain.endsWith('.' + allowedDomain);
-    });
-  } catch (error) {
-    console.error(`❌ Error parsing URL: ${error.message}`);
-    return false;
-  }
-}
-
-// Cache configuration
-const CACHE_DIR = path.join(__dirname, 'cache');
-const memoryCache = new NodeCache({ 
-  stdTTL: MEMORY_CACHE_TTL, 
-  checkperiod: 300, // Check every 5 minutes
-  maxKeys: MAX_MEMORY_CACHE_KEYS,
-  deleteOnExpire: true
-});
-
-// Ensure cache directory exists
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  console.log(`🌸 Created cache directory at ${CACHE_DIR}`);
-}
-
-// Generate cache key from URL and dimensions
-function generateCacheKey(url, width, height) {
-  return crypto
-    .createHash('md5')
-    .update(`${url}-${width}-${height}`)
-    .digest('hex');
-}
-
-// Get image path from cache
-function getCacheFilePath(cacheKey) {
-  return path.join(CACHE_DIR, `${cacheKey}.jpg`);
-}
-
-// Check if image exists in cache (prioritize disk cache)
-function getFromCache(url, width, height) {
-  const cacheKey = generateCacheKey(url, width, height);
-  
-  // Check file cache first (more reliable for reducing browser usage)
-  const filePath = getCacheFilePath(cacheKey);
-  if (fs.existsSync(filePath)) {
-    try {
-      const stats = fs.statSync(filePath);
-      const now = Date.now();
-      const fileAge = now - stats.mtimeMs;
-      const maxAgeMs = DISK_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
-      
-      // Only use disk cache if file is not too old
-      if (fileAge <= maxAgeMs) {
-        const fileBuffer = fs.readFileSync(filePath);
-        
-        // Only store in memory cache if we have room and it's frequently accessed
-        if (memoryCache.keys().length < MAX_MEMORY_CACHE_KEYS) {
-          memoryCache.set(cacheKey, fileBuffer);
-        }
-        
-        return fileBuffer;
-      } else {
-        // File is too old, delete it
-        fs.unlinkSync(filePath);
-        console.log(`🗑️ Deleted expired cache file: ${cacheKey}`);
-      }
-    } catch (error) {
-      console.error(`❌ Error reading from cache: ${error.message}`);
-      return null;
-    }
-  }
-  
-  // Check memory cache as fallback
-  const memCacheResult = memoryCache.get(cacheKey);
-  if (memCacheResult) {
-    return memCacheResult;
-  }
-  
-  return null;
-}
-
-// Save image to cache (prioritize disk cache for persistence)
-function saveToCache(url, width, height, imageBuffer) {
-  const cacheKey = generateCacheKey(url, width, height);
-  const filePath = getCacheFilePath(cacheKey);
-  
-  try {
-    // Check cache size before saving new files
-    if (!exceedsCacheSize(imageBuffer.length)) {
-      // Always save to file cache for persistence
-      fs.writeFileSync(filePath, imageBuffer);
-      
-      // Only save to memory cache if we have room (minimize memory usage)
-      if (memoryCache.keys().length < MAX_MEMORY_CACHE_KEYS) {
-        memoryCache.set(cacheKey, imageBuffer);
-      }
-      
-      console.log(`💖 Cached image for ${url}`);
-      return true;
-    } else {
-      console.warn('⚠️ Cache size limit reached. Running cleanup...');
-      cleanupCache(true); // Force cleanup
-      return false;
-    }
-  } catch (error) {
-    console.error(`❌ Error saving to cache: ${error.message}`);
-    return false;
-  }
-}
-
-// Check if adding a new file would exceed cache size limit
-function exceedsCacheSize(newFileSizeBytes) {
-  try {
-    const files = fs.readdirSync(CACHE_DIR);
-    let totalSize = 0;
-    
-    for (const file of files) {
-      if (!file.endsWith('.jpg')) continue;
-      
-      const filePath = path.join(CACHE_DIR, file);
-      const stats = fs.statSync(filePath);
-      totalSize += stats.size;
-    }
-    
-    // Convert MB to bytes for comparison
-    const maxSizeBytes = MAX_CACHE_SIZE_MB * 1024 * 1024;
-    return (totalSize + newFileSizeBytes) > maxSizeBytes;
-  } catch (error) {
-    console.error(`❌ Error checking cache size: ${error.message}`);
-    return false; // On error, assume we can still save
-  }
-}
-
-// Cleanup old cache files
-function cleanupCache(force = false) {
-  const now = Date.now();
-  const maxAge = force ? 1 : DISK_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000; // Configurable days in milliseconds, or 1ms if forced
-  
-  try {
-    const files = fs.readdirSync(CACHE_DIR);
-    let deletedCount = 0;
-    
-    // Sort files by age, oldest first
-    const fileStats = files
-      .filter(file => file.endsWith('.jpg'))
-      .map(file => {
-        const filePath = path.join(CACHE_DIR, file);
-        const stats = fs.statSync(filePath);
-        return { file, filePath, mtimeMs: stats.mtimeMs };
-      })
-      .sort((a, b) => a.mtimeMs - b.mtimeMs);
-    
-    for (const { file, filePath, mtimeMs } of fileStats) {
-      const fileAge = now - mtimeMs;
-      
-      if (fileAge > maxAge) {
-        fs.unlinkSync(filePath);
-        deletedCount++;
-        
-        // If we're doing a forced cleanup, stop after removing 20% of files
-        if (force && deletedCount >= Math.ceil(fileStats.length * 0.2)) {
-          break;
-        }
-      }
-    }
-    
-    if (deletedCount > 0) {
-      console.log(`🧹 Cleaned up ${deletedCount} cache entries`);
-    }
-  } catch (error) {
-    console.error(`❌ Error during cache cleanup: ${error.message}`);
-  }
-}
-
-// Browser instance that will be reused
 let browser = null;
 let browserQueue = [];
 let isBrowserInitializing = false;
-let browserIdleTimer = null;
+let isShuttingDown = false;
 
-// Initialize browser when needed
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+
+// Rate limiting
+app.use((req, res, next) => {
+  if (isShuttingDown) {
+    return res.status(503).send('Server is shutting down');
+  }
+  if (browserQueue.length >= MAX_CONCURRENT_REQUESTS) {
+    return res.status(429).send('Too many requests');
+  }
+  next();
+});
+
+function isDomainAllowed(url) {
+  if (DEV_MODE) return true;
+  try {
+    const urlObj = new URL(url);
+    const domain = urlObj.hostname.toLowerCase();
+    return ALLOWED_DOMAINS.some(allowed =>
+      domain === allowed || domain.endsWith('.' + allowed)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function generateCacheKey(url, width, height) {
+  return crypto.createHash('md5').update(`${url}-${width}-${height}`).digest('hex');
+}
+
+async function checkR2Cache(key, ttlDays = CACHE_TTL_DAYS) {
+  try {
+    const response = await s3Client.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    const lastModified = response.LastModified;
+    if (!lastModified) return { exists: false };
+
+    const ageMs = Date.now() - lastModified.getTime();
+    const maxAgeMs = ttlDays * 24 * 60 * 60 * 1000;
+
+    if (ageMs > maxAgeMs) {
+      console.log(`Cache expired: ${key} (${Math.floor(ageMs / 86400000)} days old, ttl: ${ttlDays}d)`);
+      return { exists: false, expired: true };
+    }
+
+    return { exists: true };
+  } catch {
+    return { exists: false };
+  }
+}
+
+async function uploadToR2(key, buffer) {
+  await s3Client.send(new PutObjectCommand({
+    Bucket: R2_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: 'image/png',
+    CacheControl: 'public, max-age=31536000',
+  }));
+}
+
 async function initBrowser() {
   if (browser) return browser;
   if (isBrowserInitializing) {
-    // Wait for browser to initialize
     while (isBrowserInitializing) {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
@@ -262,444 +126,207 @@ async function initBrowser() {
   isBrowserInitializing = true;
   try {
     browser = await puppeteer.launch({
-      headless: "new",
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      headless: 'new',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
         '--disable-gpu',
-        '--disable-extensions',
-        '--disable-audio-output'
-      ]
+        '--font-render-hinting=none',
+        '--disable-font-subpixel-positioning',
+        '--force-color-profile=srgb',
+      ],
     });
-    console.log('🌸 Browser initialized!');
+    console.log('Browser initialized');
     return browser;
   } finally {
     isBrowserInitializing = false;
   }
 }
 
-// Close browser when queue is empty with idle timeout
-async function closeBrowserIfQueueEmpty() {
-  if (browserQueue.length === 0 && browser) {
-    // Clear any existing timer
-    if (browserIdleTimer) {
-      clearTimeout(browserIdleTimer);
-    }
-    
-    // Set timer to close browser after idle timeout
-    browserIdleTimer = setTimeout(async () => {
-      if (browserQueue.length === 0 && browser && !isShuttingDown) {
-        try {
-          await browser.close();
-          browser = null;
-          browserIdleTimer = null;
-          console.log('✨ Browser closed after idle timeout!');
-        } catch (error) {
-          console.error('❌ Error closing idle browser:', error.message);
-        }
-      }
-    }, BROWSER_IDLE_TIMEOUT);
-  }
-}
+async function captureScreenshot(targetUrl, width, height) {
+  const browser = await initBrowser();
+  const page = await browser.newPage();
 
-// Add request to queue and process
-async function processRequest(targetUrl, parsedWidth, parsedHeight, res) {
-  browserQueue.push({ targetUrl, parsedWidth, parsedHeight, res });
-  
-  if (browserQueue.length === 1) {
-    // Start processing if this is the only request
-    processNextRequest();
-  }
-}
-
-// Process next request in queue
-async function processNextRequest() {
-  if (browserQueue.length === 0 || isShuttingDown) {
-    await closeBrowserIfQueueEmpty();
-    return;
-  }
-  
-  // Clear idle timer since we're processing a request
-  if (browserIdleTimer) {
-    clearTimeout(browserIdleTimer);
-    browserIdleTimer = null;
-  }
-
-  const { targetUrl, parsedWidth, parsedHeight, res } = browserQueue[0];
-  
-  // Check if we're shutting down before processing
-  if (isShuttingDown) {
-    res.status(503).send('Server is shutting down');
-    browserQueue.shift();
-    return;
-  }
-  
   try {
-    const browser = await initBrowser();
-    const page = await browser.newPage();
-    
-    try {
-      // Set a navigation timeout
-      page.setDefaultNavigationTimeout(30000);
-      
-      // Block unnecessary resources to improve performance and security
-      await page.setRequestInterception(true);
-      page.on('request', (req) => {
-        // Abort all requests if shutting down
-        if (isShuttingDown) {
-          req.abort();
-          return;
-        }
-        
-        const resourceType = req.resourceType();
-        if (['media', 'font', 'websocket'].includes(resourceType)) {
-          req.abort();
-        } else {
-          req.continue();
-        }
-      });
-      
-      await page.setViewport({
-        width: parsedWidth,
-        height: parsedHeight,
-        deviceScaleFactor: 1,
-      });
-      
-      // Check shutdown state before navigation
+    page.setDefaultNavigationTimeout(30000);
+
+    await page.setRequestInterception(true);
+    page.on('request', req => {
       if (isShuttingDown) {
-        res.status(503).send('Server is shutting down');
+        req.abort();
         return;
       }
-      
-      await page.goto(targetUrl, {
-        waitUntil: 'networkidle2',
-        timeout: 30000,
-      });
-      
-      // Check shutdown state before screenshot
-      if (isShuttingDown) {
-        res.status(503).send('Server is shutting down');
-        return;
+      const type = req.resourceType();
+      // Only block media and websocket, allow fonts for icons
+      if (['media', 'websocket'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
       }
-      
-      const screenshot = await page.screenshot({
-        type: 'jpeg',
-        quality: 90,
-      });
-      
-      // Save to cache
-      saveToCache(targetUrl, parsedWidth, parsedHeight, screenshot);
-      
-      // Set response headers and send image
-      res.setHeader('Content-Type', 'image/jpeg');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-      res.setHeader('X-Cache', 'MISS');
-      res.send(screenshot);
-      
-      console.log(`✅ Screenshot of ${targetUrl} sent successfully!`);
-    } finally {
-      await page.close();
-    }
-  } catch (error) {
-    if (!isShuttingDown) {
-      console.error(`❌ Error capturing screenshot: ${error.message}`);
-      res.status(500).send('Error capturing screenshot');
-    }
+    });
+
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Inject CSS to remove focus outlines only
+    await page.addStyleTag({
+      content: `
+        *:focus, *:focus-visible {
+          outline: none !important;
+        }
+        *::-moz-focus-inner {
+          border: 0 !important;
+        }
+      `
+    });
+
+    // Click body to clear any focused elements
+    await page.click('body').catch(() => {});
+
+    // Small wait for any CSS transitions to settle
+    await new Promise(r => setTimeout(r, 100));
+
+    const screenshot = await page.screenshot({ type: 'png' });
+    return screenshot;
   } finally {
-    // Remove processed request from queue
-    browserQueue.shift();
-    // Process next request if any (and not shutting down)
-    if (!isShuttingDown) {
-      processNextRequest();
-    }
+    await page.close();
   }
 }
 
-// Close browser and database on server shutdown
-let isShuttingDown = false;
+async function processRequest(targetUrl, width, height, res, skipCache = false, customTtlDays = null) {
+  const cacheKey = generateCacheKey(targetUrl, width, height);
+  const r2Key = `${cacheKey}.png`;
+  const cdnUrl = `https://${CDN_DOMAIN}/${r2Key}`;
+  const ttlDays = customTtlDays || CACHE_TTL_DAYS;
 
-async function gracefulShutdown(signal) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-  
-  console.log(`💕 Received ${signal}, starting graceful shutdown...`);
-  
-  // Set a timeout for forced shutdown
-  const forceShutdownTimeout = setTimeout(() => {
-    console.log('⚠️ Force shutdown after timeout');
-    process.exit(1);
-  }, 10000); // 10 seconds timeout
-  
   try {
-    // Clear the browser queue to prevent new requests
-    browserQueue.length = 0;
-    
-    // Clear browser idle timer
-    if (browserIdleTimer) {
-      clearTimeout(browserIdleTimer);
-      browserIdleTimer = null;
+    // Check cache unless nocache param is set
+    if (!skipCache) {
+      const cache = await checkR2Cache(r2Key, ttlDays);
+      if (cache.exists) {
+        console.log(`Cache hit: ${targetUrl}`);
+        return res.redirect(302, cdnUrl);
+      }
+      console.log(`${cache.expired ? 'Cache expired' : 'Cache miss'}: ${targetUrl} at ${width}x${height}`);
+    } else {
+      console.log(`No-cache request: ${targetUrl} at ${width}x${height}`);
     }
-    
-    // Close browser if it exists
-    if (browser) {
-      console.log('🌸 Closing browser...');
-      await browser.close();
-      browser = null;
-    }
-    
-    console.log('✨ Graceful shutdown completed!');
-    clearTimeout(forceShutdownTimeout);
-    process.exit(0);
+
+    const screenshot = await captureScreenshot(targetUrl, width, height);
+
+    // Upload to R2 (replaces if exists)
+    await uploadToR2(r2Key, screenshot);
+    console.log(`Uploaded: ${r2Key}`);
+
+    // Redirect to CDN
+    res.redirect(302, cdnUrl);
   } catch (error) {
-    console.error('❌ Error during shutdown:', error);
-    clearTimeout(forceShutdownTimeout);
-    process.exit(1);
-  }
-}
-
-// Handle both SIGINT (Ctrl+C) and SIGTERM (Docker stop)
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-  gracefulShutdown('uncaughtException');
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-  gracefulShutdown('unhandledRejection');
-});
-
-// Middleware to handle server errors
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).send('Internal server error');
-});
-
-// Default welcome page
-app.get('/', async (req, res) => {
-  const { url, width = 1200, height = 630 } = req.query;
-  
-  // If no URL provided, show welcome page
-  if (!url) {
-    return res.send(`
-      <html>
-        <head>
-          <title>URL to OpenGraph Image Service</title>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <meta name="description" content="Generate OpenGraph images from any URL. Perfect for social media previews and link sharing.">
-          <meta name="keywords" content="opengraph, og image, url to image, screenshot service, social media preview">
-          <meta name="author" content="url2og">
-          
-          <!-- Open Graph / Facebook -->
-          <meta property="og:type" content="website">
-          <meta property="og:url" content="https://github.com/Melchizedek6809/url2og">
-          <meta property="og:title" content="URL to OpenGraph Image Service">
-          <meta property="og:description" content="Generate OpenGraph images from any URL. Perfect for social media previews and link sharing.">
-          
-          <!-- Twitter -->
-          <meta name="twitter:card" content="summary_large_image">
-          <meta name="twitter:title" content="URL to OpenGraph Image Service">
-          <meta name="twitter:description" content="Generate OpenGraph images from any URL. Perfect for social media previews and link sharing.">
-          
-          <style>
-            body {
-              font-family: Arial, sans-serif;
-              max-width: 800px;
-              margin: 0 auto;
-              padding: 20px;
-              line-height: 1.6;
-            }
-            h1 { color: #ff69b4; }
-            code {
-              background: #f4f4f4;
-              padding: 2px 5px;
-              border-radius: 3px;
-            }
-            .example {
-              background: #f9f9f9;
-              padding: 10px;
-              border-left: 3px solid #ff69b4;
-              margin: 15px 0;
-            }
-            .info {
-              background: #fff8dc;
-              border-left: 3px solid #ffd700;
-              padding: 10px;
-              margin: 15px 0;
-            }
-          </style>
-        </head>
-        <body>
-          <h1>✨ URL to OpenGraph Image Service ✨</h1>
-          <p>This service converts any URL into an OpenGraph-sized screenshot.</p>
-          
-          ${WHITELIST_ENABLED ? `
-          <div class="info">
-            <p><strong>⚠️ Note:</strong> This service is restricted to whitelisted domains only.</p>
-            <p>Allowed domains: ${ALLOWED_DOMAINS.map(domain => `<a href="https://${domain}" target="_blank">${domain}</a>`).join(', ')}</p>
-          </div>
-          ` : ''}
-          
-          <h2>How to use:</h2>
-          <div class="example">
-            <p>Basic usage:</p>
-            <code>http://localhost:${PORT}/?url=https://example.com</code>
-          </div>
-          
-          <div class="example">
-            <p>Custom dimensions:</p>
-            <code>http://localhost:${PORT}/?url=https://example.com&width=1200&height=630</code>
-          </div>
-          
-          <h2>Try it now!</h2>
-          <form action="/" method="get">
-            <p>
-              <label for="url">URL to capture:</label><br>
-              <input type="text" id="url" name="url" placeholder="https://example.com" style="width: 300px; padding: 5px;">
-            </p>
-            <p>
-              <label for="width">Width:</label>
-              <input type="number" id="width" name="width" value="1200" min="50" max="${MAX_WIDTH}" style="width: 70px; padding: 5px;">
-              
-              <label for="height">Height:</label>
-              <input type="number" id="height" name="height" value="630" min="50" max="${MAX_HEIGHT}" style="width: 70px; padding: 5px;">
-            </p>
-            <button type="submit">Generate Image</button>
-          </form>
-          
-          <footer style="margin-top: 30px; border-top: 1px solid #eee; padding-top: 15px; text-align: center; font-size: 14px;">
-            <p>🌟 <a href="https://github.com/Melchizedek6809/url2og" target="_blank">View source code on GitHub</a> 🌟</p>
-          </footer>
-        </body>
-      </html>
-    `);
-  }
-
-  // Parse dimensions to integers
-  let parsedWidth = parseInt(width);
-  let parsedHeight = parseInt(height);
-  
-  // Validate dimensions with limits
-  if (isNaN(parsedWidth) || parsedWidth < 50) parsedWidth = 1200;
-  if (isNaN(parsedHeight) || parsedHeight < 50) parsedHeight = 630;
-  if (parsedWidth > MAX_WIDTH) parsedWidth = MAX_WIDTH;
-  if (parsedHeight > MAX_HEIGHT) parsedHeight = MAX_HEIGHT;
-  
-  // Validate URL 
-  let targetUrl = url;
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    targetUrl = `https://${url}`;
-  }
-  
-  // Add URL2OG=1 parameter to the URL
-  targetUrl += targetUrl.includes('?') ? '&URL2OG=1' : '?URL2OG=1';
-  
-  // Additional URL validation - reject URLs with control characters or very long URLs
-  if (/[\u0000-\u001F\u007F-\u009F]/.test(targetUrl) || targetUrl.length > 2000) {
-    return res.status(400).send('Invalid URL');
-  }
-  
-  // Check if domain is allowed
-  if (!isDomainAllowed(targetUrl)) {
-    console.error(`🚫 Blocked request for non-whitelisted domain: ${targetUrl}`);
-    return res.status(403).send(`
-      <html>
-        <head>
-          <title>Access Denied</title>
-          <style>
-            body {
-              font-family: Arial, sans-serif;
-              max-width: 800px;
-              margin: 0 auto;
-              padding: 20px;
-              line-height: 1.6;
-              text-align: center;
-            }
-            h1 { color: #ff4500; }
-            .error {
-              background: #fff0f0;
-              border-left: 3px solid #ff4500;
-              padding: 15px;
-              margin: 20px 0;
-              text-align: left;
-            }
-          </style>
-        </head>
-        <body>
-          <h1>🚫 Access Denied</h1>
-          <div class="error">
-            <p>Sorry, this domain is not in the allowed domains list.</p>
-            <p>This service is restricted to specific domains only.</p>
-            ${ALLOWED_DOMAINS.length > 0 ? `<p>Allowed domains: ${ALLOWED_DOMAINS.join(', ')}</p>` : ''}
-          </div>
-          <p><a href="/">Return to homepage</a></p>
-        </body>
-      </html>
-    `);
-  }
-  
-  try {
-    // Check cache first
-    const cachedImage = getFromCache(targetUrl, parsedWidth, parsedHeight);
-    
-    if (cachedImage) {
-      console.log(`🍰 Cache hit for ${targetUrl}!`);
-      
-      // Set response headers and send cached image
-      res.setHeader('Content-Type', 'image/jpeg');
-      res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
-      res.setHeader('X-Cache', 'HIT');
-      
-      return res.send(cachedImage);
-    }
-    
-    console.log(`🔍 Cache miss! Capturing screenshot of ${targetUrl} at ${parsedWidth}x${parsedHeight} pixels...`);
-    await processRequest(targetUrl, parsedWidth, parsedHeight, res);
-  } catch (error) {
-    console.error(`❌ Error capturing screenshot: ${error.message}`);
+    console.error(`Error: ${error.message}`);
     res.status(500).send('Error capturing screenshot');
   }
-});
+}
 
-// Health check endpoint for Docker
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
-// Start the server
-app.listen(PORT, async () => {
-  // Set up automatic cache cleanup every 24 hours
-  setInterval(() => {
-    console.log('🧹 Running scheduled cache cleanup...');
-    cleanupCache();
-  }, 24 * 60 * 60 * 1000); // 24 hours
-  
-  console.log(`(●ﾟωﾟ●) Server is running at http://localhost:${PORT}`);
-  console.log(`⚙️ Configuration:`);
-  console.log(`  - Max width: ${MAX_WIDTH}px`);
-  console.log(`  - Max height: ${MAX_HEIGHT}px`);
-  console.log(`  - Max cache size: ${MAX_CACHE_SIZE_MB}MB`);
-  console.log(`  - Max concurrent requests: ${MAX_CONCURRENT_REQUESTS}`);
-  console.log(`  - Browser idle timeout: ${BROWSER_IDLE_TIMEOUT / 1000}s`);
-  console.log(`  - Memory cache TTL: ${MEMORY_CACHE_TTL}s`);
-  console.log(`  - Max memory cache keys: ${MAX_MEMORY_CACHE_KEYS}`);
-  console.log(`  - Disk cache max age: ${DISK_CACHE_MAX_AGE_DAYS} days`);
-  
-  // Log whitelist status
-  if (WHITELIST_ENABLED) {
-    console.log(`🔒 Domain whitelist enabled with ${ALLOWED_DOMAINS.length} domains:`);
-    ALLOWED_DOMAINS.forEach(domain => console.log(`  - ${domain}`));
-  } else {
-    console.log(`⚠️ No domain whitelist configured. Any domain is allowed.`);
-    console.log(`   Set ALLOWED_DOMAINS environment variable to restrict access.`);
+app.get('/', async (req, res) => {
+  const { url, width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT, nocache, ttl } = req.query;
+  const skipCache = nocache === '1' || nocache === 'true';
+  const customTtlDays = ttl ? parseInt(ttl) : null;
+
+  if (!url) {
+    return res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>OG Image Service</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+    h1 { color: #333; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+    .example { background: #f9f9f9; padding: 15px; border-left: 3px solid #0066cc; margin: 15px 0; }
+    .domains { background: #e8f4e8; padding: 15px; border-radius: 4px; margin: 15px 0; }
+  </style>
+</head>
+<body>
+  <h1>OG Image Service</h1>
+  <p>Generate OpenGraph screenshots from URLs.</p>
+
+  <div class="domains">
+    <strong>Allowed domains:</strong><br>
+    ${ALLOWED_DOMAINS.map(d => `<code>${d}</code>`).join(', ')}
+  </div>
+
+  <h2>Usage</h2>
+  <div class="example">
+    <code>/?url=https://example.com</code><br><br>
+    <code>/?url=https://example.com&width=1280&height=720</code>
+  </div>
+
+  <p>Default: ${DEFAULT_WIDTH}x${DEFAULT_HEIGHT} PNG</p>
+</body>
+</html>`);
   }
-}); 
+
+  let parsedWidth = parseInt(width);
+  let parsedHeight = parseInt(height);
+
+  if (isNaN(parsedWidth) || parsedWidth < 50) parsedWidth = DEFAULT_WIDTH;
+  if (isNaN(parsedHeight) || parsedHeight < 50) parsedHeight = DEFAULT_HEIGHT;
+  if (parsedWidth > MAX_WIDTH) parsedWidth = MAX_WIDTH;
+  if (parsedHeight > MAX_HEIGHT) parsedHeight = MAX_HEIGHT;
+
+  let targetUrl = url;
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    targetUrl = `https://${url}`;
+  }
+
+  if (/[\u0000-\u001F\u007F-\u009F]/.test(targetUrl) || targetUrl.length > 2000) {
+    return res.status(400).send('Invalid URL');
+  }
+
+  if (!isDomainAllowed(targetUrl)) {
+    return res.status(403).send('Domain not allowed');
+  }
+
+  await processRequest(targetUrl, parsedWidth, parsedHeight, res, skipCache, customTtlDays);
+});
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`${signal} received, shutting down...`);
+
+  setTimeout(() => process.exit(1), 10000);
+
+  try {
+    browserQueue.length = 0;
+    if (browser) {
+      await browser.close();
+      browser = null;
+    }
+    console.log('Shutdown complete');
+    process.exit(0);
+  } catch (error) {
+    console.error('Shutdown error:', error);
+    process.exit(1);
+  }
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  if (DEV_MODE) {
+    console.log('DEV_MODE: All domains allowed');
+  } else {
+    console.log(`Allowed domains: ${ALLOWED_DOMAINS.join(', ')}`);
+  }
+});
